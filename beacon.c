@@ -46,46 +46,52 @@ mt7601u_beacon_txwi(struct mt7601u_dev *dev, struct sk_buff *skb)
 static int
 mt7601u_write_beacon(struct mt7601u_dev *dev, int offset, struct sk_buff *skb)
 {
-	int ret = 0;
-
-	if (WARN_ON_ONCE(BCN_SLOT_SIZE < skb->len + sizeof(struct mt76_txwi))) {
-		ret = -ENOSPC;
-		goto out;
+	if (WARN_ON_ONCE(BCN_SLOT_SIZE < skb->len + sizeof(struct mt76_txwi) + 3)) {
+		dev_kfree_skb_any(skb);
+		return -ENOSPC;
 	}
 
-	/* Make sure there is enough headroom for the txwi we are about to
-	 * push; normally mac80211 reserves it via hw->extra_tx_headroom.
-	 */
 	if (skb_cow(skb, sizeof(struct mt76_txwi))) {
-		ret = -ENOMEM;
-		goto out;
+		dev_kfree_skb_any(skb);
+		return -ENOMEM;
 	}
 
 	mt7601u_beacon_txwi(dev, skb);
-	mt7601u_wr_copy(dev, offset, skb->data, skb->len);
 
-out:
+	/* USB burst-writes (mt7601u_wr_copy) require a 4-byte aligned length;
+	 * otherwise the trailing 1-3 bytes are dropped via len/4 and the beacon
+	 * template written to SRAM gets truncated/corrupted.  The txwi byte-count
+	 * already records the real frame length, so trailing zero pad stays in the
+	 * slot but is never transmitted.
+	 */
+	if (skb_put_padto(skb, round_up(skb->len, 4)))
+		return -ENOMEM; /* skb freed by skb_put_padto */
+
+	mt7601u_wr_copy(dev, offset, skb->data, skb->len);
 	dev_kfree_skb_any(skb);
-	return ret;
+	return 0;
 }
+
+struct mt7601u_beacon_data {
+	struct mt7601u_dev *dev;
+	struct sk_buff *skb;
+};
 
 static void
 mt7601u_update_beacon_iter(void *priv, u8 *mac, struct ieee80211_vif *vif)
 {
-	struct mt7601u_dev *dev = priv;
-	struct sk_buff *skb;
+	struct mt7601u_beacon_data *data = priv;
 
-	if (!(dev->beacon_mask & BIT(0)))
+	if (data->skb)
 		return;
 
-	skb = ieee80211_beacon_get(dev->hw, vif, 0);
-	if (skb) {
-		int bcn_addr = MT_BEACON_BASE +
-			       (BCN_SLOT_SIZE * dev->beacon_data_count);
+	if (!(data->dev->beacon_mask & BIT(0)))
+		return;
 
-		if (!mt7601u_write_beacon(dev, bcn_addr, skb))
-			dev->beacon_data_count++;
-	}
+	/* Only build the template here; the actual USB write sleeps and must
+	 * run outside the RCU read-side lock held by the atomic iterator.
+	 */
+	data->skb = ieee80211_beacon_get(data->dev->hw, vif, 0);
 }
 
 static void mt7601u_resync_beacon_timer(struct mt7601u_dev *dev)
@@ -118,6 +124,7 @@ static void mt7601u_pre_tbtt_work(struct work_struct *work)
 {
 	struct mt7601u_dev *dev = container_of(work, struct mt7601u_dev,
 					       pre_tbtt_work);
+	struct mt7601u_beacon_data data = { .dev = dev };
 
 	if (!dev->beacon_mask || test_bit(MT7601U_STATE_SCANNING, &dev->state))
 		return;
@@ -128,9 +135,26 @@ static void mt7601u_pre_tbtt_work(struct work_struct *work)
 	mt76_set(dev, MT_BCN_BYPASS_MASK, 0xffff);
 	dev->beacon_data_count = 0;
 
+	/* Collect the beacon template under the iterator's RCU read lock.
+	 * This callback must not sleep (no USB I/O here).
+	 */
 	ieee80211_iterate_active_interfaces_atomic(dev->hw,
 		IEEE80211_IFACE_ITER_RESUME_ALL,
-		mt7601u_update_beacon_iter, dev);
+		mt7601u_update_beacon_iter, &data);
+
+	/* USB register writes sleep (mt7601u_burst_write_regs -> usb URB wait),
+	 * so the beacon must be written to SRAM here, OUTSIDE the atomic
+	 * iterator section.  Sleeping inside iterate_active_interfaces_atomic
+	 * triggers "Voluntary context switch within RCU read-side critical
+	 * section" and can corrupt state.
+	 */
+	if (data.skb) {
+		int bcn_addr = MT_BEACON_BASE +
+			       (BCN_SLOT_SIZE * dev->beacon_data_count);
+
+		if (!mt7601u_write_beacon(dev, bcn_addr, data.skb))
+			dev->beacon_data_count++;
+	}
 
 	mt76_wr(dev, MT_BCN_BYPASS_MASK,
 		0xff00 | ~(0xff00 >> dev->beacon_data_count));

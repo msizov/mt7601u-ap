@@ -7,7 +7,6 @@
 #include "mt7601u.h"
 #include "mac.h"
 #include <linux/etherdevice.h>
-#include <linux/unaligned.h>
 
 static int mt7601u_start(struct ieee80211_hw *hw)
 {
@@ -52,9 +51,11 @@ static int mt7601u_add_interface(struct ieee80211_hw *hw,
 
 	mvif->idx = idx;
 
-	if (vif->type == NL80211_IFTYPE_AP) {
-		/* AP uses bssidx 0 — BSSID set via bss_info_changed */
-	}
+	/* No MBSS setup here: for a single AP the vendor driver (ap_connect.c)
+	 * uses MBSS_MODE=0 (one BSSID).  mt7601u_addr_wr in bss_info_changed
+	 * programs the BSSID into DW0/DW1 and leaves MBSS_MODE=0, which is the
+	 * correct single-AP configuration for this chip.
+	 */
 
 	if (!ether_addr_equal(dev->macaddr, vif->addr))
 		mt7601u_set_macaddr(dev, vif->addr);
@@ -142,16 +143,11 @@ mt7601u_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 		mt7601u_phy_con_cal_onoff(dev, info);
 
 	if (changed & BSS_CHANGED_BSSID) {
+		/* Programs DW0 + DW1 (BSSID bytes; bits 16+ cleared => MBSS_MODE=0,
+		 * the vendor-correct single-AP setting). No further MBSS handling
+		 * is needed for one BSS.
+		 */
 		mt7601u_addr_wr(dev, MT_MAC_BSSID_DW0, info->bssid);
-
-		if (vif->type == NL80211_IFTYPE_AP &&
-		    !is_zero_ether_addr(info->bssid)) {
-			/* Set BSSID DW1 with MBSS_MODE=1 for AP data frames */
-			mt76_wr(dev, MT_MAC_BSSID_DW1,
-				get_unaligned_le16(info->bssid + 4) |
-				FIELD_PREP(MT_MAC_BSSID_DW1_MBSS_MODE, 1) |
-				MT_MAC_BSSID_DW1_MBSS_LOCAL_BIT);
-		}
 
 		/* Note: this is a hack because beacon_int is not changed
 		 *	 on leave nor is any more appropriate event generated.
