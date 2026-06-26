@@ -3,9 +3,9 @@
 
 ifneq ($(KERNELRELEASE),)
 # Called from kernel build system
-obj-m	+= mt7601u.o
+obj-m	+= mt7601u_ap.o
 
-mt7601u-objs	= \
+mt7601u_ap-objs	= \
 	usb.o init.o main.o mcu.o trace.o dma.o core.o eeprom.o phy.o \
 	mac.o util.o debugfs.o tx.o beacon.o
 
