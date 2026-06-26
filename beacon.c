@@ -11,12 +11,6 @@
 #define N_BCN_SLOTS	5
 #define BCN_SLOT_SIZE	((8192 / N_BCN_SLOTS) & ~63)
 
-/* Missing register definitions for beacon support */
-#define MT_TBTT_TIMER		0x1124
-#define MT_TBTT_TIMER_VAL	GENMASK(16, 0)
-#define MT_TSF_TIMER_DW0	0x111c
-#define MT_TSF_TIMER_DW1	0x1120
-
 static void mt7601u_set_beacon_offsets(struct mt7601u_dev *dev)
 {
 	u32 regs[4] = {};
@@ -41,8 +35,9 @@ mt7601u_beacon_txwi(struct mt7601u_dev *dev, struct sk_buff *skb)
 	memset(txwi, 0, sizeof(*txwi));
 
 	/* Beacon rate: 1Mbps CCK */
-	txwi->rate_ctl = cpu_to_le16(FIELD_PREP(MT_RXWI_RATE_MCS, 0) |
-				     FIELD_PREP(MT_RXWI_RATE_PHY, MT_PHY_TYPE_CCK));
+	txwi->rate_ctl = cpu_to_le16(FIELD_PREP(MT_TXWI_RATE_MCS, 0) |
+				     FIELD_PREP(MT_TXWI_RATE_PHY_MODE,
+						MT_PHY_TYPE_CCK));
 	txwi->len_ctl = cpu_to_le16(skb->len - sizeof(*txwi));
 
 	return txwi;
@@ -51,54 +46,92 @@ mt7601u_beacon_txwi(struct mt7601u_dev *dev, struct sk_buff *skb)
 static int
 mt7601u_write_beacon(struct mt7601u_dev *dev, int offset, struct sk_buff *skb)
 {
-	if (WARN_ON_ONCE(BCN_SLOT_SIZE < skb->len + sizeof(struct mt76_txwi)))
-		return -ENOSPC;
+	int ret = 0;
+
+	if (WARN_ON_ONCE(BCN_SLOT_SIZE < skb->len + sizeof(struct mt76_txwi))) {
+		ret = -ENOSPC;
+		goto out;
+	}
+
+	/* Make sure there is enough headroom for the txwi we are about to
+	 * push; normally mac80211 reserves it via hw->extra_tx_headroom.
+	 */
+	if (skb_cow(skb, sizeof(struct mt76_txwi))) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	mt7601u_beacon_txwi(dev, skb);
 	mt7601u_wr_copy(dev, offset, skb->data, skb->len);
-	dev_kfree_skb(skb);
-	return 0;
+
+out:
+	dev_kfree_skb_any(skb);
+	return ret;
+}
+
+static void
+mt7601u_update_beacon_iter(void *priv, u8 *mac, struct ieee80211_vif *vif)
+{
+	struct mt7601u_dev *dev = priv;
+	struct sk_buff *skb;
+
+	if (!(dev->beacon_mask & BIT(0)))
+		return;
+
+	skb = ieee80211_beacon_get(dev->hw, vif, 0);
+	if (skb) {
+		int bcn_addr = MT_BEACON_BASE +
+			       (BCN_SLOT_SIZE * dev->beacon_data_count);
+
+		if (!mt7601u_write_beacon(dev, bcn_addr, skb))
+			dev->beacon_data_count++;
+	}
+}
+
+static void mt7601u_resync_beacon_timer(struct mt7601u_dev *dev)
+{
+	u32 timer_val = dev->beacon_int << 4;
+
+	dev->tbtt_count++;
+
+	/* Beacon timer drifts by 1us every tick; the timer is configured
+	 * in 1/16 TU (64us) units.
+	 */
+	if (dev->tbtt_count < 63)
+		return;
+
+	/* The updated beacon interval takes effect after two TBTT, because
+	 * at this point the original interval has already been loaded into
+	 * the next TBTT_TIMER value.
+	 */
+	if (dev->tbtt_count == 63)
+		timer_val -= 1;
+
+	mt76_rmw_field(dev, MT_BEACON_TIME_CFG,
+		       MT_BEACON_TIME_CFG_INTVAL, timer_val);
+
+	if (dev->tbtt_count >= 64)
+		dev->tbtt_count = 0;
 }
 
 static void mt7601u_pre_tbtt_work(struct work_struct *work)
 {
 	struct mt7601u_dev *dev = container_of(work, struct mt7601u_dev,
 					       pre_tbtt_work);
-	struct sk_buff *skb;
-	int bcn_addr;
 
-	if (!dev->beacon_mask)
+	if (!dev->beacon_mask || test_bit(MT7601U_STATE_SCANNING, &dev->state))
 		return;
 
-	dev->tbtt_count++;
-
-	/* Resync beacon timer to account for drift (1us per tick) */
-	if (dev->tbtt_count >= 63) {
-		u32 timer_val = dev->beacon_int << 4;
-
-		if (dev->tbtt_count == 63)
-			timer_val -= 1;
-
-		mt76_rmw_field(dev, MT_BEACON_TIME_CFG,
-			       MT_BEACON_TIME_CFG_INTVAL, timer_val);
-
-		if (dev->tbtt_count >= 64)
-			dev->tbtt_count = 0;
-	}
+	mt7601u_resync_beacon_timer(dev);
 
 	/* Prevent corrupt transmissions during update */
 	mt76_set(dev, MT_BCN_BYPASS_MASK, 0xffff);
 	dev->beacon_data_count = 0;
 
-	skb = ieee80211_beacon_get(dev->hw, dev->beacon_vif, 0);
-	if (!skb)
-		goto out;
+	ieee80211_iterate_active_interfaces_atomic(dev->hw,
+		IEEE80211_IFACE_ITER_RESUME_ALL,
+		mt7601u_update_beacon_iter, dev);
 
-	bcn_addr = MT_BEACON_BASE + (BCN_SLOT_SIZE * dev->beacon_data_count);
-	if (!mt7601u_write_beacon(dev, bcn_addr, skb))
-		dev->beacon_data_count++;
-
-out:
 	mt76_wr(dev, MT_BCN_BYPASS_MASK,
 		0xff00 | ~(0xff00 >> dev->beacon_data_count));
 
@@ -154,6 +187,24 @@ void mt7601u_restart_pre_tbtt_timer(struct mt7601u_dev *dev)
 	hrtimer_start(&dev->pre_tbtt_timer, time, HRTIMER_MODE_REL);
 }
 
+static void mt7601u_stop_pre_tbtt_timer(struct mt7601u_dev *dev)
+{
+	do {
+		hrtimer_cancel(&dev->pre_tbtt_timer);
+		cancel_work_sync(&dev->pre_tbtt_work);
+		/* Timer can be rearmed by the work. */
+	} while (hrtimer_active(&dev->pre_tbtt_timer));
+}
+
+static void mt7601u_pre_tbtt_enable(struct mt7601u_dev *dev, bool en)
+{
+	if (en && dev->beacon_mask && dev->beacon_int &&
+	    !hrtimer_active(&dev->pre_tbtt_timer))
+		mt7601u_start_pre_tbtt_timer(dev);
+	if (!en)
+		mt7601u_stop_pre_tbtt_timer(dev);
+}
+
 void mt7601u_beacon_set_timer(struct mt7601u_dev *dev, int beacon_int)
 {
 	dev->beacon_int = beacon_int;
@@ -169,30 +220,35 @@ void mt7601u_beacon_set_timer(struct mt7601u_dev *dev, int beacon_int)
 void mt7601u_mac_set_beacon_enable(struct mt7601u_dev *dev,
 				   struct ieee80211_vif *vif, bool enable)
 {
-	if (enable) {
-		dev->beacon_mask = 1;
-		dev->beacon_vif = vif;
+	u8 old_mask = dev->beacon_mask;
+
+	/* Stop pre-TBTT timer/work before mutating beacon state. */
+	mt7601u_pre_tbtt_enable(dev, false);
+
+	if (!dev->beacon_mask)
 		dev->tbtt_count = 0;
 
+	if (enable)
+		dev->beacon_mask = 1;
+	else
+		dev->beacon_mask = 0;
+
+	if (!!old_mask == !!dev->beacon_mask)
+		goto out;
+
+	if (dev->beacon_mask)
 		mt76_set(dev, MT_BEACON_TIME_CFG,
 			 MT_BEACON_TIME_CFG_BEACON_TX |
 			 MT_BEACON_TIME_CFG_TBTT_EN |
 			 MT_BEACON_TIME_CFG_TIMER_EN);
-
-		if (dev->beacon_int)
-			mt7601u_start_pre_tbtt_timer(dev);
-	} else {
-		dev->beacon_mask = 0;
-		dev->beacon_vif = NULL;
-
+	else
 		mt76_clear(dev, MT_BEACON_TIME_CFG,
 			   MT_BEACON_TIME_CFG_BEACON_TX |
 			   MT_BEACON_TIME_CFG_TBTT_EN |
 			   MT_BEACON_TIME_CFG_TIMER_EN);
 
-		hrtimer_cancel(&dev->pre_tbtt_timer);
-		cancel_work_sync(&dev->pre_tbtt_work);
-	}
+out:
+	mt7601u_pre_tbtt_enable(dev, true);
 }
 
 void mt7601u_init_beacon_config(struct mt7601u_dev *dev)
@@ -208,4 +264,20 @@ void mt7601u_init_beacon_config(struct mt7601u_dev *dev)
 	hrtimer_init(&dev->pre_tbtt_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	dev->pre_tbtt_timer.function = mt7601u_pre_tbtt_interrupt;
 	INIT_WORK(&dev->pre_tbtt_work, mt7601u_pre_tbtt_work);
+}
+
+void mt7601u_exit_beacon_config(struct mt7601u_dev *dev)
+{
+	if (!test_bit(MT7601U_STATE_INITIALIZED, &dev->state))
+		return;
+
+	dev->beacon_mask = 0;
+
+	mt76_clear(dev, MT_BEACON_TIME_CFG,
+		   MT_BEACON_TIME_CFG_TIMER_EN |
+		   MT_BEACON_TIME_CFG_SYNC_MODE |
+		   MT_BEACON_TIME_CFG_TBTT_EN |
+		   MT_BEACON_TIME_CFG_BEACON_TX);
+
+	mt7601u_stop_pre_tbtt_timer(dev);
 }

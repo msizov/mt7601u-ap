@@ -282,6 +282,7 @@ void mt7601u_mac_config_tsf(struct mt7601u_dev *dev, bool enable, int interval)
 		MT_BEACON_TIME_CFG_TIMER_EN |
 		MT_BEACON_TIME_CFG_SYNC_MODE |
 		MT_BEACON_TIME_CFG_TBTT_EN;
+	mt7601u_wr(dev, MT_BEACON_TIME_CFG, val);
 }
 
 static void mt7601u_check_mac_err(struct mt7601u_dev *dev)

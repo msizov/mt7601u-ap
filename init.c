@@ -424,6 +424,7 @@ void mt7601u_cleanup(struct mt7601u_dev *dev)
 	if (!test_and_clear_bit(MT7601U_STATE_INITIALIZED, &dev->state))
 		return;
 
+	mt7601u_exit_beacon_config(dev);
 	mt7601u_stop_hardware(dev);
 	mt7601u_dma_cleanup(dev);
 	mt7601u_mcu_cmd_deinit(dev);
@@ -593,6 +594,10 @@ int mt7601u_register_device(struct mt7601u_dev *dev)
 	SET_IEEE80211_DEV(hw, dev->dev);
 
 	hw->queues = 4;
+	/* Reserve headroom for the txwi + 4-byte DMA TXINFO header so that
+	 * beacon templates (and TX frames) can be pushed in-place.
+	 */
+	hw->extra_tx_headroom = sizeof(struct mt76_txwi) + 4;
 	ieee80211_hw_set(hw, SIGNAL_DBM);
 	ieee80211_hw_set(hw, PS_NULLFUNC_STACK);
 	ieee80211_hw_set(hw, SUPPORTS_HT_CCK_RATES);

@@ -247,7 +247,6 @@ struct mt7601u_dev {
 	/* AP beacon support */
 	struct hrtimer pre_tbtt_timer;
 	struct work_struct pre_tbtt_work;
-	struct ieee80211_vif *beacon_vif;
 	u8 beacon_mask;
 	u8 beacon_data_count;
 	u16 beacon_int;
@@ -402,6 +401,7 @@ int mt7601u_dma_enqueue_tx(struct mt7601u_dev *dev, struct sk_buff *skb,
 
 /* Beacon */
 void mt7601u_init_beacon_config(struct mt7601u_dev *dev);
+void mt7601u_exit_beacon_config(struct mt7601u_dev *dev);
 void mt7601u_mac_set_beacon_enable(struct mt7601u_dev *dev,
 				   struct ieee80211_vif *vif, bool enable);
 void mt7601u_beacon_set_timer(struct mt7601u_dev *dev, int beacon_int);

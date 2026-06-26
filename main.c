@@ -53,26 +53,7 @@ static int mt7601u_add_interface(struct ieee80211_hw *hw,
 	mvif->idx = idx;
 
 	if (vif->type == NL80211_IFTYPE_AP) {
-		/* Set BSSID registers with MBSS mode for AP data frame matching.
-		 * Without MBSS_MODE=3 + LOCAL_BIT + MBEACON_N, the hardware
-		 * only matches management frames (via MAC addr registers) but
-		 * silently drops data frames addressed to the AP's BSSID.
-		 */
-		mt76_wr(dev, MT_MAC_BSSID_DW0,
-			get_unaligned_le32(vif->addr));
-		mt76_wr(dev, MT_MAC_BSSID_DW1,
-			get_unaligned_le16(vif->addr + 4) |
-			FIELD_PREP(MT_MAC_BSSID_DW1_MBSS_MODE, 3) |
-			MT_MAC_BSSID_DW1_MBSS_LOCAL_BIT);
-		mt76_rmw_field(dev, MT_MAC_BSSID_DW1,
-			       MT_MAC_BSSID_DW1_MBEACON_N, 7);
-
-		/* Write per-BSS BSSID to APC registers */
-		mt76_wr(dev, MT_MAC_APC_BSSID_L(idx),
-			get_unaligned_le32(vif->addr));
-		mt76_rmw_field(dev, MT_MAC_APC_BSSID_H(idx),
-			       MT_MAC_APC_BSSID_H_ADDR,
-			       get_unaligned_le16(vif->addr + 4));
+		/* AP uses bssidx 0 — BSSID set via bss_info_changed */
 	}
 
 	if (!ether_addr_equal(dev->macaddr, vif->addr))
@@ -83,7 +64,6 @@ static int mt7601u_add_interface(struct ieee80211_hw *hw,
 	dev->wcid_mask[wcid / BITS_PER_LONG] |= BIT(wcid % BITS_PER_LONG);
 	mvif->group_wcid.idx = wcid;
 	mvif->group_wcid.hw_key_idx = -1;
-	rcu_assign_pointer(dev->wcid[wcid], &mvif->group_wcid);
 
 	return 0;
 }
@@ -164,23 +144,13 @@ mt7601u_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	if (changed & BSS_CHANGED_BSSID) {
 		mt7601u_addr_wr(dev, MT_MAC_BSSID_DW0, info->bssid);
 
-		if (vif->type == NL80211_IFTYPE_AP) {
-			struct mt76_vif *mvif = (struct mt76_vif *)vif->drv_priv;
-
-			/* Rewrite full BSSID DW1 with MBSS flags */
+		if (vif->type == NL80211_IFTYPE_AP &&
+		    !is_zero_ether_addr(info->bssid)) {
+			/* Set BSSID DW1 with MBSS_MODE=1 for AP data frames */
 			mt76_wr(dev, MT_MAC_BSSID_DW1,
 				get_unaligned_le16(info->bssid + 4) |
-				FIELD_PREP(MT_MAC_BSSID_DW1_MBSS_MODE, 3) |
+				FIELD_PREP(MT_MAC_BSSID_DW1_MBSS_MODE, 1) |
 				MT_MAC_BSSID_DW1_MBSS_LOCAL_BIT);
-			mt76_rmw_field(dev, MT_MAC_BSSID_DW1,
-				       MT_MAC_BSSID_DW1_MBEACON_N, 7);
-
-			/* Update per-BSS APC BSSID */
-			mt76_wr(dev, MT_MAC_APC_BSSID_L(mvif->idx),
-				get_unaligned_le32(info->bssid));
-			mt76_rmw_field(dev, MT_MAC_APC_BSSID_H(mvif->idx),
-				       MT_MAC_APC_BSSID_H_ADDR,
-				       get_unaligned_le16(info->bssid + 4));
 		}
 
 		/* Note: this is a hack because beacon_int is not changed
@@ -451,6 +421,15 @@ out:
 static int mt7601u_set_tim(struct ieee80211_hw *hw, struct ieee80211_sta *sta,
 			   bool set)
 {
+	struct mt7601u_dev *dev = hw->priv;
+
+	/* mac80211 updates its internal TIM bitmap; trigger a beacon
+	 * refresh so the change propagates without waiting for the next
+	 * periodic pre-TBTT update.
+	 */
+	if (dev->beacon_mask)
+		queue_work(system_highpri_wq, &dev->pre_tbtt_work);
+
 	return 0;
 }
 
