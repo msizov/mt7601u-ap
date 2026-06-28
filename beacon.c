@@ -285,8 +285,7 @@ void mt7601u_init_beacon_config(struct mt7601u_dev *dev)
 	mt76_wr(dev, MT_BCN_BYPASS_MASK, 0xffff);
 	mt7601u_set_beacon_offsets(dev);
 
-	hrtimer_init(&dev->pre_tbtt_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	dev->pre_tbtt_timer.function = mt7601u_pre_tbtt_interrupt;
+	hrtimer_setup(&dev->pre_tbtt_timer, mt7601u_pre_tbtt_interrupt, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	INIT_WORK(&dev->pre_tbtt_work, mt7601u_pre_tbtt_work);
 }
 
